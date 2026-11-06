@@ -1,0 +1,993 @@
+/**
+ * ПЕРЕНОС БАЛЛОВ ПО ID — безопасная версия
+ *
+ * Возможности:
+ * - перенос из текущего файла в отдельную целевую таблицу;
+ * - начисление только разницы с прошлого успешного переноса;
+ * - сохранение формул в целевых ячейках: формула оборачивается в
+ *   (СТАРАЯ_ФОРМУЛА)+(новое_начисление);
+ * - журнал операций и откат последнего переноса;
+ * - проверки дубликатов, нечисловых значений и блокировка параллельных запусков.
+ *
+ * ВАЖНО:
+ * 1. Перед первым запуском проверьте настройки CONFIG.
+ * 2. Сначала выполните scoreTransfer_transferScores() на копиях таблиц.
+ * 3. Если исходные баллы уменьшаются/обнуляются между периодами, остановите
+ *    перенос и отдельно сбросьте состояние только после проверки. Эта версия
+ *    предполагает, что значение баллов в источнике накопительное.
+ * 4. Код не управляет правами доступа к Google Sheets.
+ * 5. Если в проекте уже есть onOpen(), добавьте вызов
+ *    scoreTransfer_addMenu() внутрь существующей onOpen(), а не создавайте
+ *    вторую функцию onOpen().
+ */
+
+const scoreTransfer_CONFIG = {
+  // Источник — текущий файл
+  SOURCE_SHEET_NAME: '(почти) быстрый подсчет активы ',
+  SOURCE_ID_COL: 1,          // A
+  SOURCE_POINTS_COL: 17,      // Q
+  SOURCE_START_ROW: 2,
+
+  // Приёмник — отдельный файл
+  DEST_SPREADSHEET_ID: '1iHnwOM58jbzSDwCEOCEHU5xlfOyWcj-hocRR-LAdoak',
+  // Рекомендуется перечислить здесь точные 6 листов.
+  // null = все листы, кроме служебных листов журнала и состояния.
+  DEST_SHEET_NAMES: [ 
+    'ВЕРХОВНОЕ УПРАВЛЕНИЕ', 
+    'ВЕТВЬ НЕБА', 
+    'ВЕТВЬ ЗЕМЛИ', 
+    'ВЕТВЬ ЗНАНИЙ', 
+    'ВЕТВЬ ЖИЗНИ', 
+    'БЕЗ ВЕТВЕЙ'
+  ],
+  DEST_ID_COL: 2,             // B
+  DEST_POINTS_COL: 3,         // C
+  DEST_START_ROW: 3,
+
+  // Служебные листы в целевой таблице
+  LOG_SHEET_NAME: 'Журнал переноса',
+  STATE_SHEET_NAME: 'Состояние переноса',
+
+  // 'sum' — начислять только разницу с прошлого успешного переноса.
+  // Для обычного сценария оставьте 'sum'.
+  TRANSFER_MODE: 'sum',
+
+  // Что делать с формулой в целевой ячейке:
+  // 'preserve' — сохранить формулу, добавив начисление к её результату.
+  // 'replace'  — заменить формулу числом (не рекомендуется).
+  FORMULA_HANDLING: 'preserve',
+
+  DRY_RUN: false,
+};
+
+const scoreTransfer_LOG_HEADERS = [
+  'Batch ID', 'Дата и время', 'Пользователь', 'Лист', 'Строка', 'Столбец', 'ID игрока',
+  'Старое значение', 'Старая формула', 'Начислено', 'Новое значение',
+  'Старый итог источника', 'Новый итог источника', 'Старая заметка'
+];
+
+const scoreTransfer_STATE_HEADERS = ['ID игрока', 'Итог по последнему перенесённому из источника'];
+
+function scoreTransfer_addMenu() {
+  SpreadsheetApp.getUi()
+    .createMenu('Перенос баллов')
+    .addItem('Перенести новые баллы', 'scoreTransfer_transferScores')
+    .addItem('Откатить последний перенос', 'scoreTransfer_rollbackLast')
+    .addItem('Показать Batch ID в журнале', 'scoreTransfer_showBatchId')
+    .addItem('Скрыть Batch ID в журнале', 'scoreTransfer_hideBatchId')
+    .addSeparator()
+    .addItem('Проверить доступ и настройки', 'scoreTransfer_checkAccess')
+    .addItem('Найти исходный лист', 'scoreTransfer_findSourceSheet')
+    .addToUi();
+}
+
+function scoreTransfer_normalizeId(value) {
+  if (value === null || value === undefined) return '';
+  let s = String(value).trim();
+  if (/^\d+\.0+$/.test(s)) s = s.replace(/\.0+$/, '');
+  return s;
+}
+
+function scoreTransfer_toNumber(value, label) {
+  if (value === '' || value === null || value === undefined) return 0;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const s = String(value).trim().replace(/\s/g, '').replace(',', '.');
+  if (s !== '' && Number.isFinite(Number(s))) return Number(s);
+  throw new Error('Нечисловое значение в ' + label + ': «' + value + '»');
+}
+
+function scoreTransfer_getOrCreateSheet(ss, name, headers) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  if (sh.getLastRow() === 0) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  } else {
+    const actual = sh.getRange(1, 1, 1, headers.length).getValues()[0];
+    if (headers.some((h, i) => actual[i] !== h)) {
+      throw new Error('Структура служебного листа «' + name + '» не совпадает с ожидаемой. Не очищайте и не переименовывайте его вручную.');
+    }
+  }
+  return sh;
+}
+
+function scoreTransfer_getTargetSheetNames(dstSS, cfg) {
+  if (cfg.DEST_SHEET_NAMES && cfg.DEST_SHEET_NAMES.length) {
+    return cfg.DEST_SHEET_NAMES.slice();
+  }
+  return dstSS.getSheets()
+    .map(s => s.getName())
+    .filter(n => n !== cfg.LOG_SHEET_NAME && n !== cfg.STATE_SHEET_NAME);
+}
+
+function scoreTransfer_readState(stateSheet) {
+  const map = new Map();
+  const last = stateSheet.getLastRow();
+  if (last < 2) return map;
+  const rows = stateSheet.getRange(2, 1, last - 1, 2).getValues();
+  rows.forEach((r, i) => {
+    const id = scoreTransfer_normalizeId(r[0]);
+    if (!id) return;
+    if (map.has(id)) throw new Error('Дубликат ID «' + id + '» на листе состояния переноса.');
+    map.set(id, { row: i + 2, lastTotal: scoreTransfer_toNumber(r[1], 'состояние ID ' + id) });
+  });
+  return map;
+}
+
+function scoreTransfer_writeState(stateSheet, stateMap) {
+  const rows = Array.from(stateMap.entries())
+    .sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }))
+    .map(([id, item]) => [id, item.lastTotal]);
+  const last = stateSheet.getLastRow();
+  if (last > 1) stateSheet.getRange(2, 1, last - 1, 2).clearContent();
+  if (rows.length) stateSheet.getRange(2, 1, rows.length, 2).setValues(rows);
+}
+
+
+function scoreTransfer_readSource(source, cfg) {
+  const lastRow = source.getLastRow();
+
+  if (lastRow < cfg.SOURCE_START_ROW) {
+    return new Map();
+  }
+
+  const rowCount = lastRow - cfg.SOURCE_START_ROW + 1;
+  const lastCol = Math.max(cfg.SOURCE_ID_COL, cfg.SOURCE_POINTS_COL);
+
+  const data = source
+    .getRange(cfg.SOURCE_START_ROW, 1, rowCount, lastCol)
+    .getValues();
+
+  const map = new Map();
+  const errors = [];
+
+  data.forEach((row, i) => {
+    const rowNumber = cfg.SOURCE_START_ROW + i;
+
+    const id = scoreTransfer_normalizeId(
+      row[cfg.SOURCE_ID_COL - 1]
+    );
+
+    const rawPoints = row[cfg.SOURCE_POINTS_COL - 1];
+
+    let points;
+
+    try {
+      points = scoreTransfer_toNumber(
+        rawPoints,
+        'источник, строка ' + rowNumber
+      );
+    } catch (e) {
+      errors.push(e.message);
+      return;
+    }
+
+    // Пустые строки без ID и без начисленных баллов пропускает.
+    // Это также позволяет пропускать ячейки с формулой,
+    // возвращающей 0, если ID отсутствует.
+    if (!id) {
+      if (points !== 0) {
+        errors.push(
+          'Строка ' + rowNumber + ': есть баллы, но нет ID.'
+        );
+      }
+      return;
+    }
+
+    // Один ID должен встречаться в источнике только один раз.
+    if (map.has(id)) {
+      errors.push(
+        'ID ' + id +
+        ' повторяется в источнике (строка ' + rowNumber + ').'
+      );
+      return;
+    }
+
+    map.set(id, points);
+  });
+
+  if (errors.length) {
+    throw new Error(
+      'Источник содержит неоднозначные или некорректные данные:\n' +
+      errors.slice(0, 20).join('\n')
+    );
+  }
+
+  return map;
+}
+
+function scoreTransfer_buildTargetIndex(dstSS, cfg) {
+  const index = new Map();
+  const duplicates = [];
+  const missingSheets = [];
+  scoreTransfer_getTargetSheetNames(dstSS, cfg).forEach(name => {
+    const sheet = dstSS.getSheetByName(name);
+    if (!sheet) { missingSheets.push(name); return; }
+    const lastRow = sheet.getLastRow();
+    if (lastRow < cfg.DEST_START_ROW) return;
+    const count = lastRow - cfg.DEST_START_ROW + 1;
+    const lastCol = Math.max(cfg.DEST_ID_COL, cfg.DEST_POINTS_COL);
+    const values = sheet.getRange(cfg.DEST_START_ROW, 1, count, lastCol).getValues();
+    const formulas = sheet.getRange(cfg.DEST_START_ROW, cfg.DEST_POINTS_COL, count, 1).getFormulas();
+    const notes = sheet.getRange(cfg.DEST_START_ROW, cfg.DEST_POINTS_COL, count, 1).getNotes();
+    values.forEach((r, i) => {
+      const id = scoreTransfer_normalizeId(r[cfg.DEST_ID_COL - 1]);
+      if (!id) return;
+      if (index.has(id)) {
+        duplicates.push(id);
+        return;
+      }
+      index.set(id, {
+        sheetName: name,
+        row: cfg.DEST_START_ROW + i,
+        currentValue: r[cfg.DEST_POINTS_COL - 1],
+        formula: formulas[i][0] || '',
+        note: notes[i][0] || ''
+      });
+    });
+  });
+  if (missingSheets.length) throw new Error('Не найдены листы приёмника: ' + missingSheets.join(', '));
+  if (duplicates.length) {
+    const unique = Array.from(new Set(duplicates));
+    throw new Error('Перенос остановлен: ID встречаются на нескольких целевых строках/листах. Примеры: ' + unique.slice(0, 20).join(', '));
+  }
+  return index;
+}
+
+function scoreTransfer_formulaWithDelta(oldFormula, delta) {
+  const formula = String(oldFormula ?? '');
+
+  const body = formula.startsWith('=')
+    ? formula.slice(1)
+    : formula;
+
+  const deltaText = String(delta).replace('.', ',');
+
+  return '=(' + body + ')+(' + deltaText + ')';
+}
+
+function scoreTransfer_transferScores() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    SpreadsheetApp.getUi().alert('Другой перенос или откат уже выполняется. Подождите и попробуйте снова.');
+    return;
+  }
+
+  const ui = SpreadsheetApp.getUi();
+  const cfg = scoreTransfer_CONFIG;
+  let dstSS;
+  try {
+    const srcSS = SpreadsheetApp.getActiveSpreadsheet();
+    const source = cfg.SOURCE_SHEET_NAME
+      ? srcSS.getSheetByName(cfg.SOURCE_SHEET_NAME)
+      : srcSS.getSheets()[srcSS.getSheets().length - 1];
+    if (!source) throw new Error('Исходный лист не найден: ' + cfg.SOURCE_SHEET_NAME);
+
+    dstSS = SpreadsheetApp.openById(cfg.DEST_SPREADSHEET_ID.trim());
+    const logSheet = scoreTransfer_getOrCreateSheet(dstSS, cfg.LOG_SHEET_NAME, scoreTransfer_LOG_HEADERS);
+    const stateSheet = scoreTransfer_getOrCreateSheet(dstSS, cfg.STATE_SHEET_NAME, scoreTransfer_STATE_HEADERS);
+    scoreTransfer_formatLogSheet(logSheet);
+
+    const sourceTotals = scoreTransfer_readSource(source, cfg);
+    if (!sourceTotals.size) throw new Error('В источнике нет пар ID–баллы.');
+
+    const state = scoreTransfer_readState(stateSheet);
+    const targetIndex = scoreTransfer_buildTargetIndex(dstSS, cfg);
+    const updates = [];
+    const notFound = [];
+    const unchanged = [];
+    const decreased = [];
+
+    sourceTotals.forEach((sourceTotal, id) => {
+      const oldState = state.get(id);
+      const lastTransferred = oldState ? oldState.lastTotal : 0;
+      const delta = sourceTotal - lastTransferred;
+
+      if (delta < 0) {
+        decreased.push(id + ' (было перенесено ' + lastTransferred + ', сейчас ' + sourceTotal + ')');
+        return;
+      }
+      if (delta === 0) { unchanged.push(id); return; }
+      if (!targetIndex.has(id)) { notFound.push(id); return; }
+
+      const d = targetIndex.get(id);
+      const oldNumeric = scoreTransfer_toNumber(d.currentValue, 'приёмник ' + d.sheetName + '!' + d.row + ', ID ' + id);
+      let newValue;
+      let newFormula = '';
+      if (d.formula && cfg.FORMULA_HANDLING === 'preserve') {
+        newFormula = scoreTransfer_formulaWithDelta(d.formula, delta);
+        // Формула будет пересчитана после записи; это значение для журнала — ожидаемое.
+        newValue = oldNumeric + delta;
+      } else {
+        newValue = cfg.TRANSFER_MODE === 'sum' ? oldNumeric + delta : sourceTotal;
+      }
+
+      updates.push({
+        id, sheetName: d.sheetName, row: d.row, col: cfg.DEST_POINTS_COL,
+        oldValue: d.currentValue, oldFormula: d.formula, oldNote: d.note,
+        delta, newValue, newFormula,
+        oldSourceTotal: lastTransferred, newSourceTotal: sourceTotal
+      });
+    });
+
+    if (decreased.length) {
+      throw new Error(
+        'Перенос остановлен: баллы источника стали меньше ранее перенесённого итога. ' +
+        'Автоматически уменьшать баллы небезопасно. Проверьте источник и состояние:\n' +
+        decreased.slice(0, 15).join('\n')
+      );
+    }
+
+    if (cfg.DRY_RUN) {
+      ui.alert([
+        'ТЕСТОВЫЙ РЕЖИМ — данные не записаны.',
+        'Источник: «' + source.getName() + '»',
+        'Новых начислений: ' + updates.length,
+        'Без изменений: ' + unchanged.length,
+        'ID не найдены в приёмнике: ' + notFound.length,
+        notFound.length ? 'Не найдены: ' + notFound.slice(0, 20).join(', ') : ''
+      ].filter(Boolean).join('\n'));
+      return;
+    }
+
+    if (!updates.length) {
+      ui.alert('Новых баллов для переноса нет.\nБез изменений: ' + unchanged.length +
+        '\nНе найдены в приёмнике: ' + notFound.length +
+        (notFound.length ? '\n' + notFound.slice(0, 20).join(', ') : ''));
+      return;
+    }
+
+    const batchId = Utilities.getUuid();
+    const stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+    const user = Session.getEffectiveUser().getEmail() || '(адрес недоступен)';
+    const logRows = updates.map(u => [
+  batchId,
+  stamp,
+  user,
+  u.sheetName,
+  u.row,
+  u.col,
+  u.id,
+  u.oldValue,
+
+  // Апостроф заставляет Google Sheets сохранить формулу как текст.
+  u.oldFormula ? "'" + u.oldFormula : '',
+
+  u.delta,
+  u.newValue,
+  u.oldSourceTotal,
+  u.newSourceTotal,
+  u.oldNote
+]);
+
+    // Сначала фиксирует журнал, затем изменяет целевые ячейки и состояние.
+    const logStart = logSheet.getLastRow() + 1;
+    logSheet.getRange(logStart, 1, logRows.length, scoreTransfer_LOG_HEADERS.length).setValues(logRows);
+    SpreadsheetApp.flush();
+    scoreTransfer_formatLogSheet(logSheet);
+
+    try {
+      updates.forEach(u => {
+        const cell = dstSS.getSheetByName(u.sheetName).getRange(u.row, u.col);
+        if (u.oldFormula && cfg.FORMULA_HANDLING === 'preserve') {
+          cell.setFormula(u.newFormula);
+        } else {
+          cell.setValue(u.newValue);
+        }
+        if (u.oldFormula && cfg.FORMULA_HANDLING === 'replace') {
+          cell.setNote('scoreTransfer ' + batchId + '\nБывшая формула: ' + u.oldFormula +
+            (u.oldNote ? '\n\n' + u.oldNote : ''));
+        }
+      });
+
+      updates.forEach(u => state.set(u.id, { row: state.has(u.id) ? state.get(u.id).row : null, lastTotal: u.newSourceTotal }));
+      scoreTransfer_writeState(stateSheet, state);
+      SpreadsheetApp.flush();
+      scoreTransfer_formatStateSheet(stateSheet);
+    } catch (writeError) {
+      // Журнал остаётся для диагностики.
+      throw new Error('Ошибка во время записи. Batch ID: ' + batchId +
+        '. Журнал сохранён; проверьте целевые ячейки перед откатом. Подробности: ' + writeError.message);
+    }
+
+    ui.alert([
+      'Перенос завершён.',
+      'Источник: «' + source.getName() + '»',
+      'Новых начислений: ' + updates.length,
+      'Без изменений: ' + unchanged.length,
+      'ID не найдены в приёмнике: ' + notFound.length,
+      'Batch ID: ' + batchId,
+      'Для отмены используйте пункт меню «Откатить последний перенос».',
+      notFound.length ? '\nНе найдены: ' + notFound.slice(0, 20).join(', ') : ''
+    ].join('\n'));
+  } catch (e) {
+    ui.alert('Перенос остановлен.\n\n' + e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+function scoreTransfer_rollbackLast() {
+  const lock = LockService.getScriptLock();
+
+  if (!lock.tryLock(30000)) {
+    SpreadsheetApp.getUi().alert(
+      'Другой перенос или откат уже выполняется. Подождите и попробуйте снова.'
+    );
+    return;
+  }
+
+  const ui = SpreadsheetApp.getUi();
+  const cfg = scoreTransfer_CONFIG;
+
+  try {
+    const dstSS = SpreadsheetApp.openById(
+      cfg.DEST_SPREADSHEET_ID.trim()
+    );
+
+    const logSheet = dstSS.getSheetByName(cfg.LOG_SHEET_NAME);
+    const stateSheet = dstSS.getSheetByName(cfg.STATE_SHEET_NAME);
+
+    if (!logSheet || logSheet.getLastRow() < 2) {
+      ui.alert('Журнал пуст — нечего откатывать.');
+      return;
+    }
+
+    if (!stateSheet) {
+      throw new Error('Не найден лист состояния переноса.');
+    }
+
+    const logData = logSheet.getRange(
+      2,
+      1,
+      logSheet.getLastRow() - 1,
+      scoreTransfer_LOG_HEADERS.length
+    ).getValues();
+
+    if (!logData.length) {
+      ui.alert('Журнал пуст — нечего откатывать.');
+      return;
+    }
+
+    const lastBatchId = logData[logData.length - 1][0];
+
+    const entries = logData.filter(
+      r => String(r[0]) === String(lastBatchId)
+    );
+
+    if (!entries.length) {
+      throw new Error('Не удалось найти записи последнего пакета.');
+    }
+
+    const answer = ui.alert(
+      'Откат последнего переноса',
+      'Batch ID: ' + lastBatchId +
+      '\nЗаписей: ' + entries.length +
+      '\n\nБудет восстановлено состояние до переноса.' +
+      '\nДля старых записей исходные формулы будут восстановлены только при однозначном совпадении.' +
+      '\nПродолжить?',
+      ui.ButtonSet.OK_CANCEL
+    );
+
+    if (answer !== ui.Button.OK) return;
+
+    const conflicts = [];
+    const restorePlan = [];
+
+    entries.forEach(r => {
+      const [
+        batchId, stamp, user, sheetName,
+        row, col, id, oldValue, oldFormulaRaw,
+        deltaRaw, newValue, oldSourceTotal,
+        newSourceTotal, oldNote
+      ] = r;
+
+      const sheet = dstSS.getSheetByName(String(sheetName));
+
+      if (!sheet) {
+        conflicts.push('Не найден лист «' + sheetName + '».');
+        return;
+      }
+
+      const rowNumber = Number(row);
+      const colNumber = Number(col);
+      const delta = Number(deltaRaw);
+
+      if (
+        !Number.isInteger(rowNumber) ||
+        !Number.isInteger(colNumber) ||
+        rowNumber < 1 ||
+        colNumber < 1 ||
+        !Number.isFinite(delta)
+      ) {
+        conflicts.push(
+          'Некорректные координаты или начисление в записи: ' +
+          sheetName + '!' + row + ', ID ' + id + '.'
+        );
+        return;
+      }
+
+      const idCell = sheet.getRange(
+        rowNumber,
+        cfg.DEST_ID_COL
+      );
+
+      const currentId = scoreTransfer_normalizeId(
+        idCell.getValue()
+      );
+
+      if (currentId !== scoreTransfer_normalizeId(id)) {
+        conflicts.push(
+          'ID не совпадает: ' + sheetName + '!' + row +
+          ', ожидался ' + id + '.'
+        );
+        return;
+      }
+
+      const cell = sheet.getRange(rowNumber, colNumber);
+      const currentFormula = cell.getFormula();
+      const currentValue = cell.getValue();
+
+      // Убирает возможный апостроф-префикс.
+      let oldFormula = '';
+
+      if (typeof oldFormulaRaw === 'string') {
+        oldFormula = oldFormulaRaw.replace(/^'/, '');
+
+        if (oldFormula && !oldFormula.startsWith('=')) {
+          conflicts.push(
+            'В журнале обнаружена неоднозначная старая формула: ' +
+            sheetName + '!' + cell.getA1Notation() + '.'
+          );
+          return;
+        }
+      }
+
+      // В старом журнале строка формулы могла быть вычислена
+      // Google Sheets и заменена числовым результатом.
+      // В таком случае пробует восстановить формулу из текущей.
+      if (
+        !oldFormula &&
+        typeof oldFormulaRaw === 'number' &&
+        cfg.FORMULA_HANDLING === 'preserve'
+      ) {
+        oldFormula = scoreTransfer_recoverOldFormula(
+          currentFormula,
+          delta
+        );
+
+        if (!oldFormula) {
+          conflicts.push(
+            'Не удалось однозначно восстановить старую формулу: ' +
+            sheetName + '!' + cell.getA1Notation() +
+            '. Ячейка не будет изменена.'
+          );
+          return;
+        }
+      }
+
+      let isExpected = false;
+
+      if (oldFormula && cfg.FORMULA_HANDLING === 'preserve') {
+        const expectedFormula = scoreTransfer_formulaWithDelta(
+          oldFormula,
+          delta
+        );
+
+        isExpected = currentFormula === expectedFormula;
+
+        // Для старого пакета дополнительно сверяем числовой результат.
+        if (isExpected && typeof oldFormulaRaw === 'number') {
+          const expectedValue = Number(oldValue) + delta;
+          const actualNumeric = Number(currentValue);
+
+          isExpected =
+            Number.isFinite(actualNumeric) &&
+            Math.abs(actualNumeric - expectedValue) < 1e-7;
+        }
+      } else {
+        // Для ячеек, которые должны были получить значение,
+        // проверяет отсутствие формулы и совпадение значения.
+        isExpected =
+          !currentFormula &&
+          Number.isFinite(Number(currentValue)) &&
+          Number.isFinite(Number(newValue)) &&
+          Math.abs(Number(currentValue) - Number(newValue)) < 1e-7;
+      }
+
+      if (!isExpected) {
+        conflicts.push(
+          'Ячейка ' + sheetName + '!' + cell.getA1Notation() +
+          ' не соответствует состоянию после переноса. ' +
+          'Она не будет изменена.'
+        );
+        return;
+      }
+
+      restorePlan.push({
+        sheetName: String(sheetName),
+        row: rowNumber,
+        col: colNumber,
+        oldValue: oldValue,
+        oldFormula: oldFormula,
+        oldNote: oldNote || '',
+        id: scoreTransfer_normalizeId(id),
+        oldSourceTotal: scoreTransfer_toNumber(
+          oldSourceTotal,
+          'старое состояние ID ' + id
+        )
+      });
+    });
+
+    // При любом конфликте не изменяет ни ячейки, ни состояние,
+    // ни журнал.
+    if (conflicts.length) {
+      ui.alert(
+        'Откат остановлен: проверка не пройдена.\n\n' +
+        conflicts.slice(0, 20).join('\n') +
+        (conflicts.length > 20
+          ? '\nИ другие конфликты: ' + (conflicts.length - 20)
+          : '') +
+        '\n\nДанные не изменялись. Журнал сохранён.'
+      );
+      return;
+    }
+
+    // Проверяет состояние заранее, до восстановления ячеек.
+    const state = scoreTransfer_readState(stateSheet);
+
+    restorePlan.forEach(item => {
+      if (item.oldSourceTotal === 0) {
+        state.delete(item.id);
+      } else {
+        state.set(item.id, {
+          row: state.has(item.id)
+            ? state.get(item.id).row
+            : null,
+          lastTotal: item.oldSourceTotal
+        });
+      }
+    });
+
+    // Восстанавливает прежние значения и формулы.
+    restorePlan.forEach(item => {
+      const sheet = dstSS.getSheetByName(item.sheetName);
+      const cell = sheet.getRange(item.row, item.col);
+
+      if (item.oldFormula) {
+        cell.setFormula(item.oldFormula);
+      } else {
+        cell.setValue(item.oldValue);
+      }
+
+      cell.setNote(item.oldNote);
+    });
+
+    scoreTransfer_writeState(stateSheet, state);
+    SpreadsheetApp.flush();
+    scoreTransfer_formatStateSheet(stateSheet);
+
+    // Удаляет только записи отменённого пакета.
+    const remaining = logData.filter(
+      r => String(r[0]) !== String(lastBatchId)
+    );
+
+    const currentLastRow = logSheet.getLastRow();
+
+    if (currentLastRow > 1) {
+      logSheet.getRange(
+        2,
+        1,
+        currentLastRow - 1,
+        scoreTransfer_LOG_HEADERS.length
+      ).clearContent();
+    }
+
+    if (remaining.length) {
+      logSheet.getRange(
+        2,
+        1,
+        remaining.length,
+        scoreTransfer_LOG_HEADERS.length
+      ).setValues(remaining);
+    }
+
+    ui.alert(
+      'Откат завершён.\n' +
+      'Восстановлено ячеек: ' + restorePlan.length +
+      '\nУдалён из журнала пакет: ' + lastBatchId
+    );
+
+  } catch (e) {
+    ui.alert('Откат остановлен.\n\n' + e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+/**
+ * Восстанавливает прежнюю формулу из обёрнутой формулы переноса.
+ * Возвращает пустую строку, если однозначное восстановление невозможно.
+ */
+function scoreTransfer_recoverOldFormula(currentFormula, delta) {
+  if (
+    typeof currentFormula !== 'string' ||
+    !currentFormula.startsWith('=(')
+  ) {
+    return '';
+  }
+
+  const deltaText = String(delta).replace('.', ',');
+  const suffix = ')+(' + deltaText + ')';
+
+  if (!currentFormula.endsWith(suffix)) {
+    return '';
+  }
+
+  const body = currentFormula.slice(
+    2,
+    currentFormula.length - suffix.length
+  );
+
+  if (!body) return '';
+
+  const recovered = '=' + body;
+
+  // Проверяет, что восстановленная формула точно создаёт
+  // исходную текущую формулу при добавлении начисления.
+  const expected = scoreTransfer_formulaWithDelta(
+    recovered,
+    delta
+  );
+
+  return expected === currentFormula ? recovered : '';
+}
+
+function scoreTransfer_checkAccess() {
+  const ui = SpreadsheetApp.getUi();
+  const cfg = scoreTransfer_CONFIG;
+  try {
+    const srcSS = SpreadsheetApp.getActiveSpreadsheet();
+    const dstSS = SpreadsheetApp.openById(cfg.DEST_SPREADSHEET_ID.trim());
+    const source = cfg.SOURCE_SHEET_NAME
+      ? srcSS.getSheetByName(cfg.SOURCE_SHEET_NAME)
+      : srcSS.getSheets()[srcSS.getSheets().length - 1];
+    if (!source) throw new Error('Исходный лист не найден: ' + cfg.SOURCE_SHEET_NAME);
+
+    const lines = [
+      'Аккаунт выполнения: ' + (Session.getEffectiveUser().getEmail() || '(адрес недоступен)'),
+      '',
+      'Источник: ' + srcSS.getName() + ' / ' + source.getName(),
+      'Целевая таблица: ' + dstSS.getName(),
+      '',
+      'Листы приёмника:'
+    ];
+    scoreTransfer_getTargetSheetNames(dstSS, cfg).forEach(name => {
+      const sh = dstSS.getSheetByName(name);
+      lines.push('  ' + name + (sh ? ' — доступен' : ' — НЕ НАЙДЕН'));
+    });
+    ui.alert(lines.join('\n'));
+  } catch (e) {
+    ui.alert('Ошибка доступа.\n\n' + e.message +
+      '\n\nПроверьте ID целевой таблицы и права аккаунта, запускающего скрипт.');
+  }
+}
+
+function scoreTransfer_findSourceSheet() {
+  const cfg = scoreTransfer_CONFIG;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const lines = ['Поиск листа с парами ID–баллы:', ''];
+  let best = { name: null, count: 0 };
+
+  ss.getSheets().forEach(sheet => {
+    const lastRow = sheet.getLastRow();
+    if (lastRow < cfg.SOURCE_START_ROW) {
+      lines.push('«' + sheet.getName() + '» — пусто');
+      return;
+    }
+    const countRows = lastRow - cfg.SOURCE_START_ROW + 1;
+    const cols = Math.max(cfg.SOURCE_ID_COL, cfg.SOURCE_POINTS_COL);
+    const data = sheet.getRange(cfg.SOURCE_START_ROW, 1, countRows, cols).getValues();
+    let count = 0;
+    data.forEach(row => {
+      const id = scoreTransfer_normalizeId(row[cfg.SOURCE_ID_COL - 1]);
+      const pts = row[cfg.SOURCE_POINTS_COL - 1];
+      if (id && pts !== '' && pts !== null) count++;
+    });
+    lines.push('«' + sheet.getName() + '» — пар: ' + count);
+    if (count > best.count) best = { name: sheet.getName(), count };
+  });
+
+  if (best.count) {
+    lines.push('', 'Больше всего пар: «' + best.name + '» (' + best.count + ').',
+      "Укажите в конфиге SOURCE_SHEET_NAME: '" + best.name + "'");
+  } else {
+    lines.push('', 'Пары ID–баллы не найдены. Проверьте столбцы и начальную строку.');
+  }
+  SpreadsheetApp.getUi().alert(lines.join('\n'));
+}
+
+function scoreTransfer_showBatchId() {
+  const cfg = scoreTransfer_CONFIG;
+  const ss = SpreadsheetApp.openById(
+    cfg.DEST_SPREADSHEET_ID.trim()
+  );
+  const sheet = ss.getSheetByName(cfg.LOG_SHEET_NAME);
+
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert('Журнал переноса ещё не создан.');
+    return;
+  }
+
+  sheet.showColumns(1);
+  SpreadsheetApp.getUi().alert(
+    'Столбец Batch ID показан.'
+  );
+}
+
+function scoreTransfer_hideBatchId() {
+  const cfg = scoreTransfer_CONFIG;
+  const ss = SpreadsheetApp.openById(
+    cfg.DEST_SPREADSHEET_ID.trim()
+  );
+  const sheet = ss.getSheetByName(cfg.LOG_SHEET_NAME);
+
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert('Журнал переноса ещё не создан.');
+    return;
+  }
+
+  sheet.hideColumns(1);
+  SpreadsheetApp.getUi().alert(
+    'Столбец Batch ID скрыт.'
+  );
+}
+
+function scoreTransfer_formatLogSheet(sheet) {
+  const width = scoreTransfer_LOG_HEADERS.length;
+  const lastRow = sheet.getLastRow();
+
+  // Заголовок
+  sheet.setFrozenRows(1);
+  sheet.setRowHeight(1, 42);
+
+  sheet.getRange(1, 1, 1, width)
+    .setBackground('#d9d5d2')
+    .setFontColor('#292725')
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle')
+    .setWrap(true)
+    .setBorder(true, true, true, true, true, true,
+               '#7f8c99', SpreadsheetApp.BorderStyle.SOLID);
+
+  // Ширины столбцов (применяются всегда, до проверки данных)
+  const widths = [70, 165, 220, 230, 80, 80, 130, 140, 320, 130, 140, 165, 165, 240];
+  widths.forEach((value, i) => sheet.setColumnWidth(i + 1, value));
+
+  // Фильтр
+  const existingFilter = sheet.getFilter();
+  if (existingFilter) existingFilter.remove();
+  sheet.getRange(1, 1, Math.max(lastRow, 1), width).createFilter();
+
+  // Нет данных — только заголовок и ширины
+  if (lastRow < 2) {
+    sheet.hideColumns(1);
+    return;
+  }
+
+  // Тело
+  const count = lastRow - 1;
+  const body = sheet.getRange(2, 1, count, width);
+
+  const backgrounds = Array.from({ length: count }, (_, i) =>
+    Array(width).fill(i % 2 === 0 ? '#ffffff' : '#e2e8f0')
+  );
+
+  body
+    .setBackgrounds(backgrounds)
+    .setFontColor('#202124')
+    .setFontFamily('Arial')
+    .setFontSize(10)
+    .setVerticalAlignment('middle')
+    .setWrap(true);
+
+  sheet.setRowHeights(2, count, 38);
+
+  // Выравнивание: строка/столбец/ID (E–G) — по центру; значения (H–L) — по правому краю
+  sheet.getRange(2, 5, count, 3).setHorizontalAlignment('center');
+  sheet.getRange(2, 8, count, 5).setHorizontalAlignment('right');
+
+  // Подсветка «Начислено» (J)
+  sheet.getRange(2, 10, count, 1)
+    .setBackground('#cce8d5')
+    .setFontWeight('bold')
+    .setFontColor('#174d2b');
+
+  // Сетка
+  body.setBorder(true, true, true, true, true, true,
+                 '#7f8c99', SpreadsheetApp.BorderStyle.SOLID);
+
+  sheet.hideColumns(1);
+}
+
+function scoreTransfer_formatStateSheet(sheet) {
+  const width = scoreTransfer_STATE_HEADERS.length;   // 2 столбца: A, B
+  const lastRow = sheet.getLastRow();
+
+  // Ширины столбцов (применяются всегда)
+  const widths = [140, 320];
+  widths.forEach((value, i) => sheet.setColumnWidth(i + 1, value));
+
+  // Заголовок
+  sheet.setFrozenRows(1);
+  sheet.setRowHeight(1, 42);
+
+  sheet.getRange(1, 1, 1, width)
+    .setBackground('#d9d5d2')
+    .setFontColor('#292725')
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle')
+    .setWrap(true)
+    .setBorder(true, true, true, true, true, true,
+               '#7f8c99', SpreadsheetApp.BorderStyle.SOLID);
+
+  // Фильтр в шапке
+  const existingFilter = sheet.getFilter();
+  if (existingFilter) existingFilter.remove();
+  sheet.getRange(1, 1, Math.max(lastRow, 1), width).createFilter();
+
+  // Нет данных — только заголовок и ширины
+  if (lastRow < 2) return;
+
+  // Тело
+  const count = lastRow - 1;
+  const body = sheet.getRange(2, 1, count, width);
+
+  const backgrounds = Array.from({ length: count }, (_, i) =>
+    Array(width).fill(i % 2 === 0 ? '#ffffff' : '#e2e8f0')
+  );
+
+  body
+    .setBackgrounds(backgrounds)
+    .setFontColor('#202124')
+    .setFontFamily('Arial')
+    .setFontSize(10)
+    .setVerticalAlignment('middle')
+    .setWrap(false);
+
+  sheet.setRowHeights(2, count, 28);
+
+  // ID — по центру, итог — по правому краю (числовой формат)
+  sheet.getRange(2, 1, count, 1).setHorizontalAlignment('center');
+  sheet.getRange(2, 2, count, 1)
+    .setHorizontalAlignment('right')
+    .setNumberFormat('0');
+
+  // Сетка
+  body.setBorder(true, true, true, true, true, true,
+                 '#7f8c99', SpreadsheetApp.BorderStyle.SOLID);
+}
